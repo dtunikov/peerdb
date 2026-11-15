@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/internal"
@@ -285,7 +288,7 @@ type pullState struct {
 	req                             *model.PullRecordsRequest[model.RecordItems]
 	otelManager                     *otel_metrics.OtelManager
 	utcOffset                       time.Duration
-	recordCount                     uint32
+	recordCount                     atomic.Uint32
 	sourceSchemaAsDestinationColumn bool
 }
 
@@ -293,7 +296,7 @@ func (s *pullState) addRecord(ctx context.Context, record model.Record[model.Rec
 	if err := s.req.RecordStream.AddRecord(ctx, record); err != nil {
 		return err
 	}
-	s.recordCount++
+	s.recordCount.Add(1)
 	return nil
 }
 
@@ -321,6 +324,10 @@ func (c *SqlServerConnector) PullRecords(
 	if err != nil {
 		return err
 	}
+	parallelism := int(req.SqlServerCdcConfig.GetPullParallelism())
+	if parallelism == 0 {
+		parallelism = -1
+	}
 
 	state := &pullState{
 		req:                             req,
@@ -338,16 +345,16 @@ func (c *SqlServerConnector) PullRecords(
 	noRecordsDeadline := time.Now().Add(noRecordsTimeout)
 	var idleDeadline time.Time
 	var lastIdleCheckpoint time.Time
-	for state.recordCount < req.MaxBatchSize &&
-		(state.recordCount == 0 || time.Now().Before(idleDeadline)) &&
-		(state.recordCount > 0 || time.Now().Before(noRecordsDeadline)) {
+	for state.recordCount.Load() < req.MaxBatchSize &&
+		(state.recordCount.Load() == 0 || time.Now().Before(idleDeadline)) &&
+		(state.recordCount.Load() > 0 || time.Now().Before(noRecordsDeadline)) {
 		maxLSN, err := c.getMaxLSN(ctx)
 		if err != nil {
 			return err
 		}
 		if maxLSN.compare(last) <= 0 {
 			wait := cdcPollInterval
-			if state.recordCount > 0 {
+			if state.recordCount.Load() > 0 {
 				wait = min(wait, time.Until(idleDeadline))
 			}
 			select {
@@ -363,35 +370,40 @@ func (c *SqlServerConnector) PullRecords(
 			return err
 		}
 		from := last.next()
-		recordsBefore := state.recordCount
-		var windowRows uint32
+		recordsBefore := state.recordCount.Load()
+		var windowRows atomic.Uint32
+		group, groupCtx := errgroup.WithContext(ctx)
+		group.SetLimit(parallelism)
 		for _, table := range tables {
-			if err := c.checkRetention(ctx, table, from); err != nil {
+			group.Go(func() error {
+				if err := c.checkRetention(groupCtx, table, from); err != nil {
+					return err
+				}
+				rows, err := c.pullTableWindow(groupCtx, state, table, from, to)
+				windowRows.Add(rows)
 				return err
-			}
-			rows, err := c.pullTableWindow(ctx, state, table, from, to)
-			if err != nil {
-				return err
-			}
-			windowRows += rows
+			})
+		}
+		if err := group.Wait(); err != nil {
+			return err
 		}
 
 		last = to
 		req.RecordStream.UpdateLatestCheckpointText(last.String())
-		if recordsBefore == 0 && state.recordCount > 0 {
+		if recordsBefore == 0 && state.recordCount.Load() > 0 {
 			idleDeadline = time.Now().Add(req.IdleTimeout)
 		}
 		// nothing to sync yet, so the catalog can move forward and stay ahead of CDC cleanup
-		if state.recordCount == 0 && time.Since(lastIdleCheckpoint) >= idleCheckpointInterval {
+		if state.recordCount.Load() == 0 && time.Since(lastIdleCheckpoint) >= idleCheckpointInterval {
 			if err := c.SetLastOffset(ctx, req.FlowJobName, model.CdcCheckpoint{Text: last.String()}); err != nil {
 				return fmt.Errorf("failed to store idle checkpoint: %w", err)
 			}
 			lastIdleCheckpoint = time.Now()
 		}
-		k = adjustWindowCommits(k, windowRows, req.MaxBatchSize)
+		k = adjustWindowCommits(k, windowRows.Load(), req.MaxBatchSize)
 	}
 
-	c.logger.Info("pulled records", slog.Uint64("records", uint64(state.recordCount)), slog.String("lastLSN", last.String()))
+	c.logger.Info("pulled records", slog.Uint64("records", uint64(state.recordCount.Load())), slog.String("lastLSN", last.String()))
 	return nil
 }
 

@@ -194,6 +194,7 @@ func pullAndSyncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDC
 			OverrideReplicationSlotName: config.ReplicationSlotName,
 			RecordStream:                recordBatchPull,
 			Env:                         config.Env,
+			SqlServerCdcConfig:          config.GetSqlServerCdcConfig(),
 			InternalVersion:             config.Version,
 			Flags:                       config.Flags,
 		})
