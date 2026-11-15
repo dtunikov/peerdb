@@ -933,8 +933,10 @@ var (
 	_ CDCPullConnector                = &conncockroachdb.CockroachDBConnector{}
 	_ MirrorSourceValidationConnector = &conncockroachdb.CockroachDBConnector{}
 
-	_ ValidationConnector = &connsqlserver.SqlServerConnector{}
-	_ GetVersionConnector = &connsqlserver.SqlServerConnector{}
+	_ ValidationConnector     = &connsqlserver.SqlServerConnector{}
+	_ GetVersionConnector     = &connsqlserver.SqlServerConnector{}
+	_ GetTableSchemaConnector = &connsqlserver.SqlServerConnector{}
+	_ GetSchemaConnector      = &connsqlserver.SqlServerConnector{}
 
 	_ QueryCDCPullConnector      = &connbigquery.BigQueryConnector{}
 	_ QueryCDCSyncConnector      = &connclickhouse.ClickHouseConnector{}
