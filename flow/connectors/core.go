@@ -937,6 +937,7 @@ var (
 	_ GetVersionConnector     = &connsqlserver.SqlServerConnector{}
 	_ GetTableSchemaConnector = &connsqlserver.SqlServerConnector{}
 	_ GetSchemaConnector      = &connsqlserver.SqlServerConnector{}
+	_ QRepPullConnector       = &connsqlserver.SqlServerConnector{}
 
 	_ QueryCDCPullConnector      = &connbigquery.BigQueryConnector{}
 	_ QueryCDCSyncConnector      = &connclickhouse.ClickHouseConnector{}
