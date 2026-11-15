@@ -29,6 +29,19 @@ func (c column) typeModifier() int32 {
 	return -1
 }
 
+func (c column) qField() types.QField {
+	field := types.QField{
+		Name:     c.name,
+		Type:     c.kind,
+		Nullable: c.nullable,
+	}
+	if c.kind == types.QValueKindNumeric {
+		field.Precision = c.precision
+		field.Scale = c.scale
+	}
+	return field
+}
+
 // qkindForType maps a SQL Server system type name to a QValueKind
 func qkindForType(typeName string) (types.QValueKind, error) {
 	switch strings.ToLower(typeName) {
