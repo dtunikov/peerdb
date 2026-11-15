@@ -10,7 +10,6 @@ import (
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/model"
-	"github.com/PeerDB-io/peerdb/flow/otel_metrics"
 	"github.com/PeerDB-io/peerdb/flow/pkg/common"
 	"github.com/PeerDB-io/peerdb/flow/shared"
 )
@@ -143,14 +142,4 @@ func (c *SqlServerConnector) waitForMaxLSN(ctx context.Context, required lsn) (l
 func (c *SqlServerConnector) UpdateReplStateLastOffset(ctx context.Context, lastOffset model.CdcCheckpoint) error {
 	flowName := ctx.Value(shared.FlowNameKey).(string)
 	return c.SetLastOffset(ctx, flowName, lastOffset)
-}
-
-func (c *SqlServerConnector) PullRecords(
-	ctx context.Context,
-	catalogPool shared.CatalogPool,
-	otelManager *otel_metrics.OtelManager,
-	req *model.PullRecordsRequest[model.RecordItems],
-) error {
-	defer req.RecordStream.Close()
-	return errors.New("SQL Server CDC pull is not implemented yet")
 }

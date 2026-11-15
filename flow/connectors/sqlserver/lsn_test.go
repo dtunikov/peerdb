@@ -41,3 +41,11 @@ func TestMissingColumns(t *testing.T) {
 	require.Empty(t, missingColumns(required, []string{"b", "a", "id", "extra"}))
 	require.Equal(t, []string{"a", "b"}, missingColumns(required, []string{"id"}))
 }
+
+func TestAdjustWindowCommits(t *testing.T) {
+	require.Equal(t, uint32(128), adjustWindowCommits(256, 2000, 1000))
+	require.Equal(t, uint32(1), adjustWindowCommits(1, 2000, 1000))
+	require.Equal(t, uint32(512), adjustWindowCommits(256, 100, 1000))
+	require.Equal(t, uint32(maxWindowCommits), adjustWindowCommits(maxWindowCommits, 0, 1000))
+	require.Equal(t, uint32(256), adjustWindowCommits(256, 500, 1000))
+}

@@ -191,7 +191,9 @@ jobs:
               pkg: ''
               services: otel-collector toxiproxy openssh clickhouse clickhouse-keeper clickhouse-02 cockroachdb
             sqlserver_clickhouse:
-              packages: ./connectors/sqlserver/...
+              packages: >-
+                ./e2e/sqlserver_clickhouse/...
+                ./connectors/sqlserver/...
               pkg: ''
               services: otel-collector toxiproxy openssh clickhouse clickhouse-keeper clickhouse-02 sqlserver
             bigquery_clickhouse:

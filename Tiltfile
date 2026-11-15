@@ -447,6 +447,9 @@ e2e_test('mongodb', 'mongo_clickhouse', 'TestMongoClickhouseSuite', ['provision-
 e2e_test('cockroachdb', 'cockroachdb_clickhouse', 'TestCockroachDB', ['provision-cockroachdb'],
          vars_overrides={'COCKROACHDB_IMAGE': resolve_ancillary_env('COCKROACHDB_IMAGE')})
 
+# SQL Server to ClickHouse test suite
+e2e_test('sqlserver', 'sqlserver_clickhouse', 'TestSqlServer', ['provision-sqlserver'])
+
 # Switchboard tests
 
 e2e_test('switchboard-postgres', 'switchboard_postgres', 'TestSwitchboardPostgres', ['provision-postgres'])
