@@ -110,9 +110,9 @@ func (h *FlowRequestHandler) ListPeers(
 	query := "SELECT name, type FROM peers"
 	if internal.PeerDBOnlyClickHouseAllowed() {
 		// only the sources offered in ClickHouse-only mode plus clickhouse itself
-		query += fmt.Sprintf(" WHERE type IN (%d,%d,%d,%d,%d)",
+		query += fmt.Sprintf(" WHERE type IN (%d,%d,%d,%d,%d,%d)",
 			protos.DBType_POSTGRES, protos.DBType_MYSQL, protos.DBType_MONGO,
-			protos.DBType_COCKROACHDB, protos.DBType_CLICKHOUSE)
+			protos.DBType_COCKROACHDB, protos.DBType_SQLSERVER, protos.DBType_CLICKHOUSE)
 	}
 	rows, err := h.pool.Query(ctx, query)
 	if err != nil {
@@ -135,11 +135,13 @@ func (h *FlowRequestHandler) ListPeers(
 			peer.Type == protos.DBType_MYSQL ||
 			peer.Type == protos.DBType_MONGO ||
 			peer.Type == protos.DBType_BIGQUERY ||
-			peer.Type == protos.DBType_COCKROACHDB {
+			peer.Type == protos.DBType_COCKROACHDB ||
+			peer.Type == protos.DBType_SQLSERVER {
 			sourceItems = append(sourceItems, peer)
 		}
 		if peer.Type != protos.DBType_MYSQL &&
 			peer.Type != protos.DBType_COCKROACHDB &&
+			peer.Type != protos.DBType_SQLSERVER &&
 			peer.Type != protos.DBType_MONGO && (!internal.PeerDBOnlyClickHouseAllowed() || peer.Type == protos.DBType_CLICKHOUSE) {
 			destinationItems = append(destinationItems, peer)
 		}
