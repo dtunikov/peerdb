@@ -2220,6 +2220,8 @@ func getPeerHostName(peerType protos.DBType, peer *protos.Peer) string {
 		return shared.Val(peer.GetMongoConfig()).TlsHost
 	case protos.DBType_CLICKHOUSE:
 		return shared.Val(peer.GetClickhouseConfig()).Host
+	case protos.DBType_SQLSERVER:
+		return shared.Val(peer.GetSqlserverConfig()).Server
 	}
 	return ""
 }
