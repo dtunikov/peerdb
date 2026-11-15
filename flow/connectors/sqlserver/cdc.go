@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	mssql "github.com/microsoft/go-mssqldb"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
@@ -27,6 +28,9 @@ const (
 	captureStartPollInterval = time.Second
 	captureStartTimeout      = 2 * time.Minute
 )
+
+// raised by fn_cdc_get_all_changes_* for an LSN range outside the capture instance's validity interval
+const errCDCInvalidLSNRange = 313
 
 type captureInstance struct {
 	name     string
@@ -376,9 +380,6 @@ func (c *SqlServerConnector) PullRecords(
 		group.SetLimit(parallelism)
 		for _, table := range tables {
 			group.Go(func() error {
-				if err := c.checkRetention(groupCtx, table, from); err != nil {
-					return err
-				}
 				rows, err := c.pullTableWindow(groupCtx, state, table, from, to)
 				windowRows.Add(rows)
 				return err
@@ -413,6 +414,11 @@ func (c *SqlServerConnector) pullTableWindow(
 ) (uint32, error) {
 	rows, err := c.db.QueryContext(ctx, table.changesQuery, from[:], to[:])
 	if err != nil {
+		if msErr, ok := errors.AsType[mssql.Error](err); ok && msErr.Number == errCDCInvalidLSNRange {
+			if retErr := c.checkRetention(ctx, table, from); retErr != nil {
+				return 0, retErr
+			}
+		}
 		return 0, fmt.Errorf("failed to read changes of %s: %w", table.sourceName, err)
 	}
 	defer rows.Close()
