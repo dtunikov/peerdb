@@ -88,6 +88,11 @@ on:
         type: string
         required: false
         default: ''
+      sqlserver_image:
+        description: Docker image for the sqlserver ancillary service (SQLSERVER_IMAGE).
+        type: string
+        required: false
+        default: ''
   # Reuse the exact same inputs when invoked from another workflow. The o11y
   # secrets are optional: a caller can pass them explicitly or via
   # `secrets: inherit`; when absent, test-results ingestion is skipped.
@@ -158,7 +163,7 @@ concurrency:
   # - Consecutive commits in a PR branch cancel their builds.
   # - Consecutive commits in main do not cancel each other's runs.
   #
-  group: tilt-flow-${{ github.event.pull_request.number || github.ref }}-${{ inputs.run_label }}-${{ inputs.postgres_image }}-${{ inputs.mysql_gtid_image }}-${{ inputs.mysql_pos_image }}-${{ inputs.mariadb_image }}-${{ inputs.mongodb_image }}-${{ inputs.clickhouse_image }}-${{ inputs.cockroachdb_image }}-${{ github.event_name == 'push' && github.sha || '' }}
+  group: tilt-flow-${{ github.event.pull_request.number || github.ref }}-${{ inputs.run_label }}-${{ inputs.postgres_image }}-${{ inputs.mysql_gtid_image }}-${{ inputs.mysql_pos_image }}-${{ inputs.mariadb_image }}-${{ inputs.mongodb_image }}-${{ inputs.clickhouse_image }}-${{ inputs.cockroachdb_image }}-${{ inputs.sqlserver_image }}-${{ github.event_name == 'push' && github.sha || '' }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
@@ -189,6 +194,7 @@ env:
   MONGODB_IMAGE: ${{ inputs.mongodb_image }}
   CLICKHOUSE_IMAGE: ${{ inputs.clickhouse_image }}
   COCKROACHDB_IMAGE: ${{ inputs.cockroachdb_image }}
+  SQLSERVER_IMAGE: ${{ inputs.sqlserver_image }}
   # If OTEL is present in the list of services, we enable it
   # to be used in the PeerDB services.
   ENABLE_OTEL_METRICS: ${{ contains(inputs.ancillary_services, 'otel-collector') && 'true' || 'false' }}
@@ -227,7 +233,7 @@ jobs:
         id: run-identity
         env:
           RUN_LABEL: ${{ inputs.run_label }}
-          RAW_IDENTITY: "${{ inputs.test_packages }} ${{ inputs.pkg_test_packages }} ${{ inputs.postgres_image }} ${{ inputs.mysql_gtid_image }} ${{ inputs.mysql_pos_image }} ${{ inputs.mariadb_image }} ${{ inputs.mongodb_image }} ${{ inputs.clickhouse_image }} ${{ inputs.cockroachdb_image }}"
+          RAW_IDENTITY: "${{ inputs.test_packages }} ${{ inputs.pkg_test_packages }} ${{ inputs.postgres_image }} ${{ inputs.mysql_gtid_image }} ${{ inputs.mysql_pos_image }} ${{ inputs.mariadb_image }} ${{ inputs.mongodb_image }} ${{ inputs.clickhouse_image }} ${{ inputs.cockroachdb_image }} ${{ inputs.sqlserver_image }}"
         run: |
           label="${RUN_LABEL:-$RAW_IDENTITY}"
           suffix="$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | sed 's/^-*//; s/-*$//')"

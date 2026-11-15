@@ -214,6 +214,31 @@ services:
       timeout: 10s
       retries: 5
 
+  sqlserver:
+    container_name: peerdb-sqlserver
+    image: ${SQLSERVER_IMAGE}
+    # SQL Server images are amd64 only
+    platform: linux/amd64
+    restart: unless-stopped
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    ports:
+      - "${CI_SQLSERVER_PORT}:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${CI_SQLSERVER_PASSWORD}
+      # CDC capture runs as a SQL Agent job
+      MSSQL_AGENT_ENABLED: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # mssql-tools18 replaced mssql-tools in newer images
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
   postgres:
     container_name: peerdb-postgres
     image: ${POSTGRES_IMAGE}
@@ -342,6 +367,7 @@ volumes:
   mysql_pos_data:
   mariadb_data:
   cockroach_data:
+  sqlserver_data:
 
 networks:
   default:

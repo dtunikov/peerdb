@@ -468,6 +468,10 @@ func LogPeerInfo(ctx context.Context, peer *protos.Peer, version string, variant
 		info.TLSHost = config.CockroachdbConfig.TlsHost
 		info.SshHost = config.CockroachdbConfig.SshConfig.GetHost()
 		info.DatabaseName = config.CockroachdbConfig.Database
+	case *protos.Peer_SqlserverConfig:
+		info.Host = config.SqlserverConfig.Server
+		info.Port = config.SqlserverConfig.Port
+		info.DatabaseName = config.SqlserverConfig.Database
 	case *protos.Peer_MysqlConfig:
 		info.Host = config.MysqlConfig.Host
 		info.Port = config.MysqlConfig.Port

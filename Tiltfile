@@ -137,6 +137,14 @@ local_resource(
 )
 
 local_resource(
+    'provision-sqlserver',
+    cmd='./local_provision_scripts/sqlserver.sh',
+    labels=['Ancillary-DB-Provisioning'],
+    resource_deps=['sqlserver'],
+    allow_parallel=True,
+)
+
+local_resource(
     'provision-mysql-gtid',
     cmd='./local_provision_scripts/mysql.sh peerdb-mysql-gtid',
     labels=['Ancillary-DB-Provisioning'],
@@ -281,6 +289,10 @@ dc_resource('clickhouse-02', labels=['Ancillary-DB'], links=[
 
 dc_resource('cockroachdb', labels=['Ancillary-DB'], links=[
     link('http://localhost:' + resolve_ancillary_env('CI_COCKROACH_PORT', '26257'), 'CockroachDB'),
+], auto_init=False)
+
+dc_resource('sqlserver', labels=['Ancillary-DB'], links=[
+    link('http://localhost:' + resolve_ancillary_env('CI_SQLSERVER_PORT', '1433'), 'SQL Server'),
 ], auto_init=False)
 
 dc_resource('mongodb', labels=['Ancillary-DB'], links=[
@@ -474,6 +486,8 @@ connector_test('mysql', ['provision-mariadb'], vars_overrides=mariadb_vars, name
 connector_test('mongo', ['provision-mongodb'])
 
 connector_test('clickhouse', ['provision-clickhouse'])
+
+connector_test('sqlserver', ['provision-sqlserver'])
 
 # flow/pkg module tests
 

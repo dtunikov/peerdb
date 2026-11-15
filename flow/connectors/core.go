@@ -22,6 +22,7 @@ import (
 	connpubsub "github.com/PeerDB-io/peerdb/flow/connectors/pubsub"
 	conns3 "github.com/PeerDB-io/peerdb/flow/connectors/s3"
 	connsnowflake "github.com/PeerDB-io/peerdb/flow/connectors/snowflake"
+	connsqlserver "github.com/PeerDB-io/peerdb/flow/connectors/sqlserver"
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/model"
@@ -669,6 +670,8 @@ func getConnector(ctx context.Context, env map[string]string, config *protos.Pee
 		return connelasticsearch.NewElasticsearchConnector(ctx, inner.ElasticsearchConfig)
 	case *protos.Peer_CockroachdbConfig:
 		return conncockroachdb.NewCockroachDBConnector(ctx, env, inner.CockroachdbConfig)
+	case *protos.Peer_SqlserverConfig:
+		return connsqlserver.NewSqlServerConnector(ctx, inner.SqlserverConfig)
 	default:
 		return nil, errors.ErrUnsupported
 	}
@@ -929,6 +932,9 @@ var (
 	_ GetSchemaConnector              = &conncockroachdb.CockroachDBConnector{}
 	_ CDCPullConnector                = &conncockroachdb.CockroachDBConnector{}
 	_ MirrorSourceValidationConnector = &conncockroachdb.CockroachDBConnector{}
+
+	_ ValidationConnector = &connsqlserver.SqlServerConnector{}
+	_ GetVersionConnector = &connsqlserver.SqlServerConnector{}
 
 	_ QueryCDCPullConnector      = &connbigquery.BigQueryConnector{}
 	_ QueryCDCSyncConnector      = &connclickhouse.ClickHouseConnector{}

@@ -145,6 +145,16 @@ func GetCockroachDBConfigFromEnv() *protos.CockroachDBConfig {
 	}
 }
 
+func GetSqlServerConfigFromEnv() *protos.SqlServerConfig {
+	return &protos.SqlServerConfig{
+		Server:   GetEnvString("CI_SQLSERVER_HOST", "localhost"),
+		Port:     uint32(getEnvUint[uint16]("CI_SQLSERVER_PORT", 1433)),
+		User:     GetEnvString("CI_SQLSERVER_USER", "sa"),
+		Password: GetEnvString("CI_SQLSERVER_PASSWORD", ""),
+		Database: GetEnvString("CI_SQLSERVER_DATABASE", "peerdb_e2e"),
+	}
+}
+
 // setupAWSCredsFromEnv copies the three AWS_* credential env vars from sources
 // named "<sourcePrefix>AWS_ACCESS_KEY_ID" etc. into the unprefixed AWS_* names
 // for the duration of the test. Each source must be non-empty.

@@ -99,6 +99,12 @@ func CreatePeerNoValidate(
 			return wrongConfigResponse, nil
 		}
 		innerConfig = crdbConfigObject.CockroachdbConfig
+	case protos.DBType_SQLSERVER:
+		sqlServerConfigObject, ok := config.(*protos.Peer_SqlserverConfig)
+		if !ok {
+			return wrongConfigResponse, nil
+		}
+		innerConfig = sqlServerConfigObject.SqlserverConfig
 	default:
 		return wrongConfigResponse, nil
 	}
