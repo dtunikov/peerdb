@@ -232,6 +232,10 @@ func (c *SqlServerConnector) prepareCDCTables(ctx context.Context, req *model.Pu
 			destinationName: destination,
 			captureInstance: ci.name,
 			columns:         columns,
+			// start_lsn - lsn of tx from which the row change originates
+			// seqval - orders the operations inside a transaction
+			// operation - insert, update, delete (also update with old values when 'all update old' is used)
+			// tran_end_time - tx commit timestamp
 			changesQuery: fmt.Sprintf(`
 				SELECT c.__$start_lsn, c.__$seqval, c.__$operation, m.tran_end_time, %s
 				FROM cdc.%s(@p1, @p2, N'all update old') c
@@ -426,11 +430,9 @@ func (c *SqlServerConnector) PullRecords(
 				caughtUpSince = time.Now()
 			}
 
-			// Max LSN also stands still on an idle database, so a stopped capture job (e.g. SQL Server Agent down)
-			// would otherwise look like no changes. Once caught up for captureStallTimeout, the loop checks the
-			// capture job's log scan sessions and returns SqlServerCaptureJobStalledError if it stopped scanning.
-			// The error is retryable and notifies the user; the mirror resumes once the job runs again, since
-			// CDC holds log truncation until the capture job has read the log.
+			// max lsn also stands still on an idle database, so a stopped capture job (e.g. SQL Server Agent down)
+			// would otherwise look like no changes
+			// error out if capture job hasn't scanned anything for more than captureStallTimeout
 			if stallCheckEnabled && time.Since(caughtUpSince) >= captureStallTimeout &&
 				time.Since(lastStallCheck) >= captureStallCheckInterval {
 				lastStallCheck = time.Now()
