@@ -126,7 +126,7 @@ func (c *SqlServerConnector) SetupReplication(
 	if err := c.SetLastOffset(ctx, req.FlowJobName, model.CdcCheckpoint{Text: startLSN.String()}); err != nil {
 		return model.SetupReplicationResult{}, fmt.Errorf("failed to store starting LSN: %w", err)
 	}
-	c.logger.Info("stored starting LSN", slog.String("lsn", startLSN.String()))
+	c.logger.Info("[sqlserver] stored starting LSN", slog.String("lsn", startLSN.String()))
 	return model.SetupReplicationResult{}, nil
 }
 
@@ -166,6 +166,10 @@ const (
 
 	initialWindowCommits = 16
 	maxWindowCommits     = 1 << 20
+
+	// how long the capture job may go without scanning the log before PullRecords fails
+	captureStallTimeout       = 10 * time.Minute
+	captureStallCheckInterval = time.Minute
 )
 
 // __$operation values in 'all update old' mode
@@ -257,6 +261,34 @@ func (c *SqlServerConnector) windowEnd(ctx context.Context, last lsn, maxLSN lsn
 	}
 	end, err := lsnFromBytes(b)
 	return end, uint32(commits), err
+}
+
+// checkCaptureJobScanning fails when the capture job stopped scanning the log. Max LSN alone cannot tell,
+// it also stands still on an idle database. A running capture job records a scan session every polling
+// interval, empty ones included, so a stale last scan means the job is not running.
+func (c *SqlServerConnector) checkCaptureJobScanning(ctx context.Context) error {
+	var secondsSinceScan sql.NullInt64
+	var scanning sql.NullBool
+	if err := c.db.QueryRowContext(ctx, `
+		SELECT DATEDIFF(SECOND, MAX(end_time), GETDATE()),
+			CAST(MAX(CASE WHEN scan_phase <> 'Done' THEN 1 ELSE 0 END) AS BIT)
+		FROM sys.dm_cdc_log_scan_sessions
+		WHERE session_id <> 0`).Scan(&secondsSinceScan, &scanning); err != nil {
+		return fmt.Errorf("failed to read CDC log scan sessions: %w", err)
+	}
+	// a long scan of a large transaction is progress, not a stall
+	if scanning.Bool {
+		return nil
+	}
+	sinceScan := time.Duration(secondsSinceScan.Int64) * time.Second
+	if secondsSinceScan.Valid && sinceScan < captureStallTimeout {
+		return nil
+	}
+	// no sessions since the instance started means the job never ran
+	if !secondsSinceScan.Valid {
+		sinceScan = 0
+	}
+	return exceptions.NewSqlServerCaptureJobStalledError(sinceScan)
 }
 
 func (c *SqlServerConnector) checkRetention(ctx context.Context, table *cdcTable, from lsn) error {
@@ -367,12 +399,14 @@ func (c *SqlServerConnector) PullRecords(
 	if k == 0 {
 		k = initialWindowCommits
 	}
-	c.logger.Info("pulling records", slog.String("lastLSN", last.String()), slog.Int("tables", len(tables)),
+	c.logger.Info("[sqlserver] pulling records", slog.String("lastLSN", last.String()), slog.Int("tables", len(tables)),
 		slog.Uint64("windowCommits", uint64(k)))
 	defer func() { c.windowCommits.Store(k) }()
 	noRecordsDeadline := time.Now().Add(noRecordsTimeout)
 	var idleDeadline time.Time
 	var lastIdleCheckpoint time.Time
+	var caughtUpSince, lastStallCheck time.Time
+	stallCheckEnabled := true
 	// The loop stops when:
 	// - the batch is full OR
 	// - IdleTimeout passes after the first record OR
@@ -388,6 +422,27 @@ func (c *SqlServerConnector) PullRecords(
 		if maxLSN.compare(last) <= 0 {
 			// caught up, so an idle mirror does not keep reporting the lag of its last change
 			otelManager.Metrics.SourceLagGauge.Record(ctx, 0)
+			if caughtUpSince.IsZero() {
+				caughtUpSince = time.Now()
+			}
+
+			// Max LSN also stands still on an idle database, so a stopped capture job (e.g. SQL Server Agent down)
+			// would otherwise look like no changes. Once caught up for captureStallTimeout, the loop checks the
+			// capture job's log scan sessions and returns SqlServerCaptureJobStalledError if it stopped scanning.
+			// The error is retryable and notifies the user; the mirror resumes once the job runs again, since
+			// CDC holds log truncation until the capture job has read the log.
+			if stallCheckEnabled && time.Since(caughtUpSince) >= captureStallTimeout &&
+				time.Since(lastStallCheck) >= captureStallCheckInterval {
+				lastStallCheck = time.Now()
+				if err := c.checkCaptureJobScanning(ctx); err != nil {
+					if _, ok := errors.AsType[*exceptions.SqlServerCaptureJobStalledError](err); ok {
+						return err
+					}
+					// best effort: the DMV needs VIEW DATABASE (PERFORMANCE) STATE
+					c.logger.Warn("[sqlserver] unable to check CDC capture job progress", slog.Any("error", err))
+					stallCheckEnabled = false
+				}
+			}
 			wait := cdcPollInterval
 			if state.recordCount.Load() > 0 {
 				wait = min(wait, time.Until(idleDeadline))
@@ -399,6 +454,8 @@ func (c *SqlServerConnector) PullRecords(
 			}
 			continue
 		}
+
+		caughtUpSince = time.Time{}
 
 		to, windowCommits, err := c.windowEnd(ctx, last, maxLSN, k)
 		if err != nil {
@@ -437,7 +494,7 @@ func (c *SqlServerConnector) PullRecords(
 		}
 		// adjusts k for the next window
 		if newK := adjustWindowCommits(k, windowCommits, windowRows.Load(), req.MaxBatchSize); newK != k {
-			c.logger.Info("adjusted CDC window size",
+			c.logger.Info("[sqlserver] adjusted CDC window size",
 				slog.Uint64("oldWindowCommits", uint64(k)),
 				slog.Uint64("newWindowCommits", uint64(newK)),
 				slog.Uint64("lastWindowCommits", uint64(windowCommits)),
@@ -447,7 +504,7 @@ func (c *SqlServerConnector) PullRecords(
 		}
 	}
 
-	c.logger.Info("pulled records", slog.Uint64("records", uint64(state.recordCount.Load())), slog.String("lastLSN", last.String()),
+	c.logger.Info("[sqlserver] pulled records", slog.Uint64("records", uint64(state.recordCount.Load())), slog.String("lastLSN", last.String()),
 		slog.Uint64("windowCommits", uint64(k)))
 	return nil
 }

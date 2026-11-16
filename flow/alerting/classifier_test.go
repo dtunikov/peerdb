@@ -131,6 +131,16 @@ func TestSqlServerCDCDataCleanedUpShouldNotifyUser(t *testing.T) {
 	assert.Equal(t, ErrorInfo{Source: ErrorSourceSqlServer, Code: "CDC_DATA_CLEANED_UP"}, errInfo)
 }
 
+func TestSqlServerCaptureJobStalledShouldNotifyUser(t *testing.T) {
+	t.Parallel()
+
+	err := fmt.Errorf("PullRecords failed: %w", exceptions.NewSqlServerCaptureJobStalledError(15*time.Minute))
+	errorClass, errInfo := GetErrorClass(t.Context(), err)
+	assert.Equal(t, ErrorNotifySqlServerCaptureJobStalled, errorClass)
+	assert.Equal(t, NotifyUser, errorClass.ErrorAction())
+	assert.Equal(t, ErrorInfo{Source: ErrorSourceSqlServer, Code: "CDC_CAPTURE_JOB_STALLED"}, errInfo)
+}
+
 func TestUnwrappedPgErrorShouldKeepPostgresSource(t *testing.T) {
 	t.Parallel()
 

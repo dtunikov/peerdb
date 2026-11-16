@@ -91,7 +91,7 @@ func (c *SqlServerConnector) Close() error {
 		return nil
 	}
 	if err := c.db.Close(); err != nil {
-		c.logger.Error("failed to close SQL Server connection", slog.Any("error", err))
+		c.logger.Error("[sqlserver] failed to close SQL Server connection", slog.Any("error", err))
 		return fmt.Errorf("failed to close SQL Server connection: %w", err)
 	}
 	return nil

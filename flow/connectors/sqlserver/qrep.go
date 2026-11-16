@@ -74,7 +74,7 @@ func (c *SqlServerConnector) GetQRepPartitions(
 		return nil, fmt.Errorf("watermark column %s not found in %s", config.WatermarkColumn, table)
 	}
 	if !isIntegerKind(columns[idx].kind) {
-		c.logger.Info("watermark column is not an integer, using a full table partition",
+		c.logger.Info("[sqlserver] watermark column is not an integer, using a full table partition",
 			slog.String("table", table.String()), slog.String("column", config.WatermarkColumn))
 		return utils.FullTablePartition(), nil
 	}
@@ -106,7 +106,7 @@ func (c *SqlServerConnector) GetQRepPartitions(
 	if numPartitions == 0 {
 		numPartitions = shared.AdjustNumPartitions(totalRows, int64(config.NumRowsPerPartition)).AdjustedNumPartitions
 	}
-	c.logger.Info("partitioning table",
+	c.logger.Info("[sqlserver] partitioning table",
 		slog.String("table", table.String()),
 		slog.Int64("rows", totalRows),
 		slog.Int64("partitions", numPartitions))
@@ -174,14 +174,14 @@ func (c *SqlServerConnector) PullQRepRecords(
 		}
 		totalRecords++
 		if totalRecords%50000 == 0 {
-			c.logger.Info("pulling records", slog.Int64("records", totalRecords))
+			c.logger.Info("[sqlserver] pulling records", slog.Int64("records", totalRecords))
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return 0, 0, fmt.Errorf("failed to read rows of %s: %w", config.WatermarkTable, err)
 	}
 
-	c.logger.Info("pulled records", slog.Int64("records", totalRecords))
+	c.logger.Info("[sqlserver] pulled records", slog.Int64("records", totalRecords))
 	return totalRecords, 0, nil
 }
 
