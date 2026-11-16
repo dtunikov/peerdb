@@ -347,16 +347,15 @@ func (c *SqlServerConnector) serverUTCOffset(ctx context.Context) (time.Duration
 }
 
 // adjustWindowCommits sizes the next window from how many records the last one produced.
-// Commits vary a lot in size, so a fixed k either overshoots the batch on large transactions
-// or wastes round trips on small ones. When the window alone exceeded the batch, shrink k in
-// proportion so the next one lands near half a batch. When it filled less than a quarter, double k,
-// but only if k was the limit: a window cut short by fewer pending commits says nothing about k,
-// and growing there would let an idle mirror ratchet k up to the max before the next burst.
 func adjustWindowCommits(k, windowCommits, windowRecords, maxBatchSize uint32) uint32 {
+	// too many records receieved
 	if windowRecords > maxBatchSize {
+		// target half the max batch size
 		target := max(maxBatchSize/2, 1)
+		// reduce k proportionally to target/windowRecords
 		return max(uint32(uint64(k)*uint64(target)/uint64(windowRecords)), 1)
 	}
+	// too few records receieved
 	if windowRecords < maxBatchSize/4 && windowCommits >= k {
 		return min(k*2, maxWindowCommits)
 	}
