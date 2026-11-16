@@ -158,6 +158,8 @@ func (c *SqlServerConnector) UpdateReplStateLastOffset(ctx context.Context, last
 }
 
 const (
+	// how long to wait before re-checking max LSN when the capture job has nothing past the last LSN;
+	// windows are pulled back to back while changes are pending
 	cdcPollInterval        = time.Second
 	noRecordsTimeout       = time.Hour
 	idleCheckpointInterval = time.Minute
@@ -237,21 +239,24 @@ func (c *SqlServerConnector) prepareCDCTables(ctx context.Context, req *model.Pu
 	return tables, nil
 }
 
-// windowEnd returns the k-th commit after last, or maxLSN when fewer commits are pending
-func (c *SqlServerConnector) windowEnd(ctx context.Context, last lsn, maxLSN lsn, k uint32) (lsn, error) {
+// windowEnd returns the k-th commit after last (or the last pending one when fewer are pending)
+// and how many commits the window covers
+func (c *SqlServerConnector) windowEnd(ctx context.Context, last lsn, maxLSN lsn, k uint32) (lsn, uint32, error) {
 	var b []byte
+	var commits int64
 	if err := c.db.QueryRowContext(ctx, `
-		SELECT MAX(start_lsn) FROM (
+		SELECT MAX(start_lsn), COUNT(*) FROM (
 			SELECT TOP (@p1) start_lsn FROM cdc.lsn_time_mapping
 			WHERE start_lsn > @p2 AND start_lsn <= @p3
 			ORDER BY start_lsn
-		) w`, k, last[:], maxLSN[:]).Scan(&b); err != nil {
-		return lsn{}, fmt.Errorf("failed to compute window end: %w", err)
+		) w`, k, last[:], maxLSN[:]).Scan(&b, &commits); err != nil {
+		return lsn{}, 0, fmt.Errorf("failed to compute window end: %w", err)
 	}
 	if b == nil {
-		return maxLSN, nil
+		return maxLSN, 0, nil
 	}
-	return lsnFromBytes(b)
+	end, err := lsnFromBytes(b)
+	return end, uint32(commits), err
 }
 
 func (c *SqlServerConnector) checkRetention(ctx context.Context, table *cdcTable, from lsn) error {
@@ -278,11 +283,18 @@ func (c *SqlServerConnector) serverUTCOffset(ctx context.Context) (time.Duration
 	return time.Duration(minutes) * time.Minute, nil
 }
 
-func adjustWindowCommits(k uint32, windowRows uint32, maxBatchSize uint32) uint32 {
+// adjustWindowCommits sizes the next window from how many rows the last one produced.
+// Commits vary a lot in size, so a fixed k either overshoots the batch on large transactions
+// or wastes round trips on small ones. When the window alone exceeded the batch, shrink k in
+// proportion so the next one lands near half a batch. When it filled less than a quarter, double k,
+// but only if k was the limit: a window cut short by fewer pending commits says nothing about k,
+// and growing there would let an idle mirror ratchet k up to the max before the next burst.
+func adjustWindowCommits(k, windowCommits, windowRows, maxBatchSize uint32) uint32 {
 	if windowRows > maxBatchSize {
-		return max(k/2, 1)
+		target := max(maxBatchSize/2, 1)
+		return max(uint32(uint64(k)*uint64(target)/uint64(windowRows)), 1)
 	}
-	if windowRows < maxBatchSize/4 {
+	if windowRows < maxBatchSize/4 && windowCommits >= k {
 		return min(k*2, maxWindowCommits)
 	}
 	return k
@@ -304,6 +316,18 @@ func (s *pullState) addRecord(ctx context.Context, record model.Record[model.Rec
 	return nil
 }
 
+// PullRecords reads change tables in windows of k commits, starting after the checkpointed LSN.
+//
+// Each iteration:
+//  1. waits for the capture job to advance max LSN past last
+//  2. picks the window end: the k-th commit after last (from cdc.lsn_time_mapping), capped at max LSN
+//  3. reads every table's changes in (last, to] in parallel
+//  4. moves last to the window end and adjusts k for the next window
+//
+// Windows end on a commit boundary and every table is read up to the same LSN, so the checkpoint
+// never splits a transaction and stays valid for all tables. Bounding by commits instead of reading
+// up to max LSN keeps a single query from returning an unbounded backlog after a long pause.
+// k survives across batches on the connector, so the next batch starts with a tuned size.
 func (c *SqlServerConnector) PullRecords(
 	ctx context.Context,
 	catalogPool shared.CatalogPool,
@@ -339,16 +363,20 @@ func (c *SqlServerConnector) PullRecords(
 		utcOffset:                       utcOffset,
 		sourceSchemaAsDestinationColumn: sourceSchemaAsDestinationColumn,
 	}
-	c.logger.Info("pulling records", slog.String("lastLSN", last.String()), slog.Int("tables", len(tables)))
-
 	k := c.windowCommits.Load()
 	if k == 0 {
 		k = initialWindowCommits
 	}
+	c.logger.Info("pulling records", slog.String("lastLSN", last.String()), slog.Int("tables", len(tables)),
+		slog.Uint64("windowCommits", uint64(k)))
 	defer func() { c.windowCommits.Store(k) }()
 	noRecordsDeadline := time.Now().Add(noRecordsTimeout)
 	var idleDeadline time.Time
 	var lastIdleCheckpoint time.Time
+	// The loop stops when:
+	// - the batch is full OR
+	// - IdleTimeout passes after the first record OR
+	// - noRecordsTimeout passes without any records
 	for state.recordCount.Load() < req.MaxBatchSize &&
 		(state.recordCount.Load() == 0 || time.Now().Before(idleDeadline)) &&
 		(state.recordCount.Load() > 0 || time.Now().Before(noRecordsDeadline)) {
@@ -356,7 +384,10 @@ func (c *SqlServerConnector) PullRecords(
 		if err != nil {
 			return err
 		}
+		// waits for the capture job to advance max LSN past last
 		if maxLSN.compare(last) <= 0 {
+			// caught up, so an idle mirror does not keep reporting the lag of its last change
+			otelManager.Metrics.SourceLagGauge.Record(ctx, 0)
 			wait := cdcPollInterval
 			if state.recordCount.Load() > 0 {
 				wait = min(wait, time.Until(idleDeadline))
@@ -369,12 +400,14 @@ func (c *SqlServerConnector) PullRecords(
 			continue
 		}
 
-		to, err := c.windowEnd(ctx, last, maxLSN, k)
+		to, windowCommits, err := c.windowEnd(ctx, last, maxLSN, k)
 		if err != nil {
 			return err
 		}
 		from := last.next()
 		recordsBefore := state.recordCount.Load()
+
+		// reads every table's changes in (from, to] in parallel
 		var windowRows atomic.Uint32
 		group, groupCtx := errgroup.WithContext(ctx)
 		group.SetLimit(parallelism)
@@ -389,6 +422,7 @@ func (c *SqlServerConnector) PullRecords(
 			return err
 		}
 
+		// moves last to the window end
 		last = to
 		req.RecordStream.UpdateLatestCheckpointText(last.String())
 		if recordsBefore == 0 && state.recordCount.Load() > 0 {
@@ -401,10 +435,20 @@ func (c *SqlServerConnector) PullRecords(
 			}
 			lastIdleCheckpoint = time.Now()
 		}
-		k = adjustWindowCommits(k, windowRows.Load(), req.MaxBatchSize)
+		// adjusts k for the next window
+		if newK := adjustWindowCommits(k, windowCommits, windowRows.Load(), req.MaxBatchSize); newK != k {
+			c.logger.Info("adjusted CDC window size",
+				slog.Uint64("oldWindowCommits", uint64(k)),
+				slog.Uint64("newWindowCommits", uint64(newK)),
+				slog.Uint64("lastWindowCommits", uint64(windowCommits)),
+				slog.Uint64("lastWindowRows", uint64(windowRows.Load())),
+				slog.Uint64("maxBatchSize", uint64(req.MaxBatchSize)))
+			k = newK
+		}
 	}
 
-	c.logger.Info("pulled records", slog.Uint64("records", uint64(state.recordCount.Load())), slog.String("lastLSN", last.String()))
+	c.logger.Info("pulled records", slog.Uint64("records", uint64(state.recordCount.Load())), slog.String("lastLSN", last.String()),
+		slog.Uint64("windowCommits", uint64(k)))
 	return nil
 }
 
