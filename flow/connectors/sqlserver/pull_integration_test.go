@@ -207,6 +207,41 @@ func TestPullRecordsBacklogKeepsTransactionsWhole(t *testing.T) {
 	require.Len(t, seenTx, transactions)
 }
 
+func TestPullRecordsMergesTablesInCommitOrder(t *testing.T) {
+	f := setupCDCFixture(t, map[string]string{
+		"a": "id INT IDENTITY PRIMARY KEY, tx INT NOT NULL",
+		"b": "id INT IDENTITY PRIMARY KEY, tx INT NOT NULL",
+	})
+	const transactions, rowsPerTx = 30, 3
+	var expected []string
+	for tx := range transactions {
+		f.exec(t, fmt.Sprintf(`BEGIN TRANSACTION;
+			INSERT INTO {schema}.a (tx) VALUES (%[1]d);
+			INSERT INTO {schema}.b (tx) VALUES (%[1]d);
+			INSERT INTO {schema}.a (tx) VALUES (%[1]d);
+			COMMIT`, tx))
+		expected = append(expected, fmt.Sprintf("%d:a", tx), fmt.Sprintf("%d:b", tx), fmt.Sprintf("%d:a", tx))
+	}
+
+	offset := f.lastOffset(t)
+	var got []string
+	batches := 0
+	for len(got) < len(expected) {
+		res, err := f.pull(t, t.Context(), offset, 10)
+		require.NoError(t, err)
+		batches++
+		require.Less(t, batches, 50)
+		require.Zero(t, len(res.records)%rowsPerTx, "transaction split across batches")
+		for _, r := range res.records {
+			tx := itemValue(t, r.(*model.InsertRecord[model.RecordItems]).Items, "tx").(int32)
+			got = append(got, fmt.Sprintf("%d:%s", tx, r.GetDestinationTableName()))
+		}
+		offset = res.checkpoint
+	}
+	require.Greater(t, batches, 1)
+	require.Equal(t, expected, got)
+}
+
 func TestPullRecordsRetentionExceeded(t *testing.T) {
 	f := setupCDCFixture(t, map[string]string{"t": "id INT PRIMARY KEY"})
 	offset := f.lastOffset(t)

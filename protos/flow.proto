@@ -115,11 +115,6 @@ message BigqueryCdcConfig {
   QueryCdcConfig query_cdc = 2;
 }
 
-message SqlServerCdcConfig {
-  // how many tables are queried concurrently per CDC window, 0 queries all tables at once
-  uint32 pull_parallelism = 1;
-}
-
 // FlowConnectionConfigs is for external use by the API, maintaining backwards compatibility
 // When adding fields here, add them to FlowConnectionConfigsCore too
 message FlowConnectionConfigs {
@@ -172,7 +167,6 @@ message FlowConnectionConfigs {
   // connector-specific mirror config, mirroring Peer's per-connector config oneof
   oneof source_connector_config {
     BigqueryCdcConfig bigquery_cdc_config = 29;
-    SqlServerCdcConfig sql_server_cdc_config = 31;
   }
 
   // Deprecated: use BigqueryCdcConfig.query_cdc.pull_sync_parallelism instead.
@@ -232,7 +226,6 @@ message FlowConnectionConfigsCore {
 
   oneof source_connector_config {
     BigqueryCdcConfig bigquery_cdc_config = 29;
-    SqlServerCdcConfig sql_server_cdc_config = 31;
   }
 
   // Deprecated: use BigqueryCdcConfig.query_cdc.pull_sync_parallelism instead.

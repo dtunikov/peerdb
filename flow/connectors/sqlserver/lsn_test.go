@@ -1,6 +1,8 @@
 package connsqlserver
 
 import (
+	"container/heap"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -42,10 +44,25 @@ func TestMissingColumns(t *testing.T) {
 	require.Equal(t, []string{"a", "b"}, missingColumns(required, []string{"id"}))
 }
 
-func TestAdjustWindowCommits(t *testing.T) {
-	require.Equal(t, uint32(128), adjustWindowCommits(256, 2000, 1000))
-	require.Equal(t, uint32(1), adjustWindowCommits(1, 2000, 1000))
-	require.Equal(t, uint32(512), adjustWindowCommits(256, 100, 1000))
-	require.Equal(t, uint32(maxWindowCommits), adjustWindowCommits(maxWindowCommits, 0, 1000))
-	require.Equal(t, uint32(256), adjustWindowCommits(256, 500, 1000))
+func TestChangeHeapOrder(t *testing.T) {
+	key := func(commit byte, commandID int, seq byte, op int) changeKey {
+		return changeKey{startLSN: lsn{9: commit}, commandID: commandID, seqval: lsn{9: seq}, operation: op}
+	}
+	h := changeHeap{}
+	for _, c := range []tableChange{
+		{change: change{key: key(2, 1, 5, opInsert)}, table: 0},
+		{change: change{key: key(1, 2, 3, opInsert)}, table: 1},
+		{change: change{key: key(1, 1, 4, opUpdateAfter)}, table: 0},
+		{change: change{key: key(1, 1, 4, opUpdateBefore)}, table: 0},
+		{change: change{key: key(2, 1, 5, opInsert)}, table: 1},
+	} {
+		heap.Push(&h, c)
+	}
+	var order []string
+	for h.Len() > 0 {
+		c := heap.Pop(&h).(tableChange)
+		order = append(order, fmt.Sprintf("%d/%d/%d/%d", c.key.startLSN[9], c.key.commandID, c.key.operation, c.table))
+	}
+	// commit first, then command within the transaction, ties broken by table
+	require.Equal(t, []string{"1/1/3/0", "1/1/4/0", "1/2/2/1", "2/1/2/0", "2/1/2/1"}, order)
 }

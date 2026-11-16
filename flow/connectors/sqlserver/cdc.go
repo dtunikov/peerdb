@@ -1,6 +1,8 @@
 package connsqlserver
 
 import (
+	"cmp"
+	"container/heap"
 	"context"
 	"database/sql"
 	"errors"
@@ -8,10 +10,8 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"time"
 
-	mssql "github.com/microsoft/go-mssqldb"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
@@ -28,9 +28,6 @@ const (
 	captureStartPollInterval = time.Second
 	captureStartTimeout      = 2 * time.Minute
 )
-
-// raised by fn_cdc_get_all_changes_* for an LSN range outside the capture instance's validity interval
-const errCDCInvalidLSNRange = 313
 
 type captureInstance struct {
 	name     string
@@ -161,12 +158,11 @@ const (
 	cdcPollInterval        = time.Second
 	noRecordsTimeout       = time.Hour
 	idleCheckpointInterval = time.Minute
-
-	initialWindowCommits = 16
-	maxWindowCommits     = 1 << 20
+	// decoded changes each table reader keeps ahead of the merge
+	tableChangesBuffer = 256
 )
 
-// __$operation values in 'all update old' mode
+// __$operation values of change table rows
 const (
 	opDelete       = 1
 	opInsert       = 2
@@ -220,6 +216,8 @@ func (c *SqlServerConnector) prepareCDCTables(ctx context.Context, req *model.Pu
 			selectList = append(selectList, "c."+quoteIdentifier(field.Name))
 		}
 
+		// reads the change table directly: ORDER BY is its clustered index, so rows stream without a sort,
+		// which fn_cdc_get_all_changes_* cannot do since it does not expose __$command_id
 		tables = append(tables, &cdcTable{
 			sourceTable:     table,
 			sourceName:      source,
@@ -227,44 +225,52 @@ func (c *SqlServerConnector) prepareCDCTables(ctx context.Context, req *model.Pu
 			captureInstance: ci.name,
 			columns:         columns,
 			changesQuery: fmt.Sprintf(`
-				SELECT c.__$start_lsn, c.__$seqval, c.__$operation, m.tran_end_time, %s
-				FROM cdc.%s(@p1, @p2, N'all update old') c
+				SELECT c.__$start_lsn, c.__$command_id, c.__$seqval, c.__$operation, m.tran_end_time, %s
+				FROM cdc.%s c
 				LEFT JOIN cdc.lsn_time_mapping m ON m.start_lsn = c.__$start_lsn
-				ORDER BY c.__$start_lsn, c.__$seqval, c.__$operation`,
-				strings.Join(selectList, ", "), quoteIdentifier("fn_cdc_get_all_changes_"+ci.name)),
+				WHERE c.__$start_lsn >= @p1 AND c.__$start_lsn <= @p2
+				ORDER BY c.__$start_lsn, c.__$command_id, c.__$seqval, c.__$operation
+				OPTION (LOOP JOIN)`,
+				strings.Join(selectList, ", "), quoteIdentifier(ci.name+"_CT")),
 		})
 	}
 	return tables, nil
 }
 
-// windowEnd returns the k-th commit after last, or maxLSN when fewer commits are pending
-func (c *SqlServerConnector) windowEnd(ctx context.Context, last lsn, maxLSN lsn, k uint32) (lsn, error) {
-	var b []byte
-	if err := c.db.QueryRowContext(ctx, `
-		SELECT MAX(start_lsn) FROM (
-			SELECT TOP (@p1) start_lsn FROM cdc.lsn_time_mapping
-			WHERE start_lsn > @p2 AND start_lsn <= @p3
-			ORDER BY start_lsn
-		) w`, k, last[:], maxLSN[:]).Scan(&b); err != nil {
-		return lsn{}, fmt.Errorf("failed to compute window end: %w", err)
-	}
-	if b == nil {
-		return maxLSN, nil
-	}
-	return lsnFromBytes(b)
-}
-
-func (c *SqlServerConnector) checkRetention(ctx context.Context, table *cdcTable, from lsn) error {
-	var b []byte
-	if err := c.db.QueryRowContext(ctx, "SELECT sys.fn_cdc_get_min_lsn(@p1)", table.captureInstance).Scan(&b); err != nil {
-		return fmt.Errorf("failed to get min LSN of %s: %w", table.captureInstance, err)
-	}
-	minLSN, err := lsnFromBytes(b)
+// checkRetention fails if CDC cleanup may have removed changes at or after from. Reading the change
+// tables directly does not raise an error for a cleaned up range, so this runs after every read:
+// cleanup only moves a capture instance's start forward, so passing afterwards covers the whole read.
+func (c *SqlServerConnector) checkRetention(ctx context.Context, tables []*cdcTable, from lsn) error {
+	rows, err := c.db.QueryContext(ctx, "SELECT capture_instance, start_lsn FROM cdc.change_tables")
 	if err != nil {
-		return fmt.Errorf("capture instance %s: %w", table.captureInstance, err)
+		return fmt.Errorf("failed to get min LSNs of capture instances: %w", err)
 	}
-	if minLSN.compare(from) > 0 {
-		return exceptions.NewSqlServerCDCDataCleanedUpError(table.captureInstance, minLSN.String(), from.String())
+	defer rows.Close()
+	minLSNs := make(map[string]lsn)
+	for rows.Next() {
+		var name string
+		var b []byte
+		if err := rows.Scan(&name, &b); err != nil {
+			return fmt.Errorf("failed to scan min LSN of capture instance: %w", err)
+		}
+		minLSN, err := lsnFromBytes(b)
+		if err != nil {
+			return fmt.Errorf("capture instance %s: %w", name, err)
+		}
+		minLSNs[name] = minLSN
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to get min LSNs of capture instances: %w", err)
+	}
+
+	for _, table := range tables {
+		minLSN, ok := minLSNs[table.captureInstance]
+		if !ok {
+			return fmt.Errorf("capture instance %s of %s no longer exists", table.captureInstance, table.sourceName)
+		}
+		if minLSN.compare(from) > 0 {
+			return exceptions.NewSqlServerCDCDataCleanedUpError(table.captureInstance, minLSN.String(), from.String())
+		}
 	}
 	return nil
 }
@@ -278,30 +284,80 @@ func (c *SqlServerConnector) serverUTCOffset(ctx context.Context) (time.Duration
 	return time.Duration(minutes) * time.Minute, nil
 }
 
-func adjustWindowCommits(k uint32, windowRows uint32, maxBatchSize uint32) uint32 {
-	if windowRows > maxBatchSize {
-		return max(k/2, 1)
+// changeKey orders changes like the change tables' clustered index. Commit LSN and command ID also
+// order changes of different tables, since they are per transaction rather than per table.
+type changeKey struct {
+	startLSN  lsn
+	seqval    lsn
+	commandID int
+	operation int
+}
+
+func (k changeKey) compare(other changeKey) int {
+	return cmp.Or(
+		k.startLSN.compare(other.startLSN),
+		cmp.Compare(k.commandID, other.commandID),
+		k.seqval.compare(other.seqval),
+		cmp.Compare(k.operation, other.operation),
+	)
+}
+
+type change struct {
+	record     model.Record[model.RecordItems]
+	commitTime time.Time
+	key        changeKey
+}
+
+type tableChange struct {
+	change
+	table int
+}
+
+// changeHeap holds the next change of each table that is still being read
+type changeHeap []tableChange
+
+func (h *changeHeap) Len() int { return len(*h) }
+func (h *changeHeap) Less(i, j int) bool {
+	if c := (*h)[i].key.compare((*h)[j].key); c != 0 {
+		return c < 0
 	}
-	if windowRows < maxBatchSize/4 {
-		return min(k*2, maxWindowCommits)
-	}
-	return k
+	return (*h)[i].table < (*h)[j].table
+}
+func (h *changeHeap) Swap(i, j int) { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
+func (h *changeHeap) Push(x any)    { *h = append(*h, x.(tableChange)) }
+func (h *changeHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
 }
 
 type pullState struct {
 	req                             *model.PullRecordsRequest[model.RecordItems]
 	otelManager                     *otel_metrics.OtelManager
+	idleDeadline                    time.Time
 	utcOffset                       time.Duration
-	recordCount                     atomic.Uint32
+	recordCount                     uint32
 	sourceSchemaAsDestinationColumn bool
 }
 
-func (s *pullState) addRecord(ctx context.Context, record model.Record[model.RecordItems]) error {
-	if err := s.req.RecordStream.AddRecord(ctx, record); err != nil {
+func (s *pullState) addRecord(ctx context.Context, ch change) error {
+	if err := s.req.RecordStream.AddRecord(ctx, ch.record); err != nil {
 		return err
 	}
-	s.recordCount.Add(1)
+	if s.recordCount == 0 {
+		s.idleDeadline = time.Now().Add(s.req.IdleTimeout)
+	}
+	s.recordCount++
+	if s.otelManager != nil && !ch.commitTime.IsZero() {
+		s.otelManager.Metrics.SourceLagGauge.Record(ctx, time.Since(ch.commitTime).Milliseconds())
+	}
 	return nil
+}
+
+// batchDone reports whether the batch is full or waited IdleTimeout since its first record
+func (s *pullState) batchDone() bool {
+	return s.recordCount >= s.req.MaxBatchSize || (s.recordCount > 0 && !time.Now().Before(s.idleDeadline))
 }
 
 func (c *SqlServerConnector) PullRecords(
@@ -328,10 +384,6 @@ func (c *SqlServerConnector) PullRecords(
 	if err != nil {
 		return err
 	}
-	parallelism := int(req.SqlServerCdcConfig.GetPullParallelism())
-	if parallelism == 0 {
-		parallelism = -1
-	}
 
 	state := &pullState{
 		req:                             req,
@@ -341,25 +393,17 @@ func (c *SqlServerConnector) PullRecords(
 	}
 	c.logger.Info("pulling records", slog.String("lastLSN", last.String()), slog.Int("tables", len(tables)))
 
-	k := c.windowCommits.Load()
-	if k == 0 {
-		k = initialWindowCommits
-	}
-	defer func() { c.windowCommits.Store(k) }()
 	noRecordsDeadline := time.Now().Add(noRecordsTimeout)
-	var idleDeadline time.Time
 	var lastIdleCheckpoint time.Time
-	for state.recordCount.Load() < req.MaxBatchSize &&
-		(state.recordCount.Load() == 0 || time.Now().Before(idleDeadline)) &&
-		(state.recordCount.Load() > 0 || time.Now().Before(noRecordsDeadline)) {
+	for !state.batchDone() && (state.recordCount > 0 || time.Now().Before(noRecordsDeadline)) {
 		maxLSN, err := c.getMaxLSN(ctx)
 		if err != nil {
 			return err
 		}
 		if maxLSN.compare(last) <= 0 {
 			wait := cdcPollInterval
-			if state.recordCount.Load() > 0 {
-				wait = min(wait, time.Until(idleDeadline))
+			if state.recordCount > 0 {
+				wait = min(wait, time.Until(state.idleDeadline))
 			}
 			select {
 			case <-ctx.Done():
@@ -369,84 +413,122 @@ func (c *SqlServerConnector) PullRecords(
 			continue
 		}
 
-		to, err := c.windowEnd(ctx, last, maxLSN, k)
+		from := last.next()
+		to, err := c.pullChanges(ctx, state, tables, from, maxLSN)
 		if err != nil {
 			return err
 		}
-		from := last.next()
-		recordsBefore := state.recordCount.Load()
-		var windowRows atomic.Uint32
-		group, groupCtx := errgroup.WithContext(ctx)
-		group.SetLimit(parallelism)
-		for _, table := range tables {
-			group.Go(func() error {
-				rows, err := c.pullTableWindow(groupCtx, state, table, from, to)
-				windowRows.Add(rows)
-				return err
-			})
-		}
-		if err := group.Wait(); err != nil {
+		if err := c.checkRetention(ctx, tables, from); err != nil {
 			return err
 		}
-
 		last = to
 		req.RecordStream.UpdateLatestCheckpointText(last.String())
-		if recordsBefore == 0 && state.recordCount.Load() > 0 {
-			idleDeadline = time.Now().Add(req.IdleTimeout)
-		}
 		// nothing to sync yet, so the catalog can move forward and stay ahead of CDC cleanup
-		if state.recordCount.Load() == 0 && time.Since(lastIdleCheckpoint) >= idleCheckpointInterval {
+		if state.recordCount == 0 && time.Since(lastIdleCheckpoint) >= idleCheckpointInterval {
 			if err := c.SetLastOffset(ctx, req.FlowJobName, model.CdcCheckpoint{Text: last.String()}); err != nil {
 				return fmt.Errorf("failed to store idle checkpoint: %w", err)
 			}
 			lastIdleCheckpoint = time.Now()
 		}
-		k = adjustWindowCommits(k, windowRows.Load(), req.MaxBatchSize)
 	}
 
-	c.logger.Info("pulled records", slog.Uint64("records", uint64(state.recordCount.Load())), slog.String("lastLSN", last.String()))
+	c.logger.Info("pulled records", slog.Uint64("records", uint64(state.recordCount)), slog.String("lastLSN", last.String()))
 	return nil
 }
 
-// pullTableWindow emits the table's changes in (from-1, to] and returns how many change rows it read
-func (c *SqlServerConnector) pullTableWindow(
-	ctx context.Context, state *pullState, table *cdcTable, from lsn, to lsn,
-) (uint32, error) {
+// pullChanges merges the tables' changes in (from-1, to] by commit and emits them. Once the batch is done
+// it stops at the next commit boundary: every table is then read past the last emitted commit, so that
+// commit is a consistent checkpoint for all tables. It returns the checkpoint, to if all changes were read.
+func (c *SqlServerConnector) pullChanges(
+	ctx context.Context, state *pullState, tables []*cdcTable, from lsn, to lsn,
+) (lsn, error) {
+	readCtx, cancelRead := context.WithCancel(ctx)
+	group, groupCtx := errgroup.WithContext(readCtx)
+	defer func() {
+		cancelRead()
+		_ = group.Wait()
+	}()
+
+	streams := make([]chan change, len(tables))
+	for i, table := range tables {
+		streams[i] = make(chan change, tableChangesBuffer)
+		group.Go(func() error {
+			return c.readTableChanges(groupCtx, state, table, from, to, streams[i])
+		})
+	}
+
+	heads := make(changeHeap, 0, len(tables))
+	// a reader closes its stream only after reading all of it, and otherwise fails through groupCtx
+	receive := func(table int) error {
+		select {
+		case ch, ok := <-streams[table]:
+			if ok {
+				heap.Push(&heads, tableChange{change: ch, table: table})
+			}
+			return nil
+		case <-groupCtx.Done():
+			if err := group.Wait(); err != nil {
+				return err
+			}
+			return groupCtx.Err()
+		}
+	}
+	for i := range streams {
+		if err := receive(i); err != nil {
+			return lsn{}, err
+		}
+	}
+
+	var commit lsn
+	for heads.Len() > 0 {
+		head := heads[0]
+		if commit != (lsn{}) && head.key.startLSN != commit && state.batchDone() {
+			return commit, nil
+		}
+		commit = head.key.startLSN
+		heap.Pop(&heads)
+		if err := state.addRecord(ctx, head.change); err != nil {
+			return lsn{}, err
+		}
+		if err := receive(head.table); err != nil {
+			return lsn{}, err
+		}
+	}
+	return to, nil
+}
+
+// readTableChanges decodes the table's changes in (from-1, to] into out, and closes out once all are read
+func (c *SqlServerConnector) readTableChanges(
+	ctx context.Context, state *pullState, table *cdcTable, from lsn, to lsn, out chan<- change,
+) error {
 	rows, err := c.db.QueryContext(ctx, table.changesQuery, from[:], to[:])
 	if err != nil {
-		if msErr, ok := errors.AsType[mssql.Error](err); ok && msErr.Number == errCDCInvalidLSNRange {
-			if retErr := c.checkRetention(ctx, table, from); retErr != nil {
-				return 0, retErr
-			}
-		}
-		return 0, fmt.Errorf("failed to read changes of %s: %w", table.sourceName, err)
+		return fmt.Errorf("failed to read changes of %s: %w", table.sourceName, err)
 	}
 	defer rows.Close()
 
 	values := make([]any, len(table.columns))
 	var startLSN, seqval []byte
-	var operation int
+	var commandID, operation int
 	var commitTime sql.NullTime
-	ptrs := make([]any, 0, len(table.columns)+4)
-	ptrs = append(ptrs, &startLSN, &seqval, &operation, &commitTime)
+	ptrs := make([]any, 0, len(table.columns)+5)
+	ptrs = append(ptrs, &startLSN, &commandID, &seqval, &operation, &commitTime)
 	for i := range values {
 		ptrs = append(ptrs, &values[i])
 	}
 
-	var count uint32
 	var before model.RecordItems
 	var beforeSeqval []byte
 	for rows.Next() {
 		if err := rows.Scan(ptrs...); err != nil {
-			return count, fmt.Errorf("failed to scan change of %s: %w", table.sourceName, err)
+			return fmt.Errorf("failed to scan change of %s: %w", table.sourceName, err)
 		}
-		count++
 
 		items := model.NewRecordItems(len(table.columns) + 1)
 		for i, col := range table.columns {
 			qv, err := qvalueFromScanned(col, values[i])
 			if err != nil {
-				return count, fmt.Errorf("table %s: %w", table.sourceName, err)
+				return fmt.Errorf("table %s: %w", table.sourceName, err)
 			}
 			items.AddColumn(col.name, qv)
 		}
@@ -455,8 +537,10 @@ func (c *SqlServerConnector) pullTableWindow(
 		}
 
 		var baseRecord model.BaseRecord
+		var committedAt time.Time
 		if commitTime.Valid {
-			baseRecord.CommitTimeNano = commitTime.Time.Add(-state.utcOffset).UnixNano()
+			committedAt = commitTime.Time.Add(-state.utcOffset)
+			baseRecord.CommitTimeNano = committedAt.UnixNano()
 		}
 
 		var record model.Record[model.RecordItems]
@@ -493,17 +577,25 @@ func (c *SqlServerConnector) pullTableWindow(
 				DestinationTableName: table.destinationName,
 			}
 		default:
-			return count, fmt.Errorf("unexpected CDC operation %d for %s", operation, table.sourceName)
+			return fmt.Errorf("unexpected CDC operation %d for %s", operation, table.sourceName)
 		}
-		if err := state.addRecord(ctx, record); err != nil {
-			return count, err
+
+		key := changeKey{commandID: commandID, operation: operation}
+		if key.startLSN, err = lsnFromBytes(startLSN); err != nil {
+			return fmt.Errorf("start LSN of %s: %w", table.sourceName, err)
 		}
-		if state.otelManager != nil && commitTime.Valid {
-			state.otelManager.Metrics.SourceLagGauge.Record(ctx, time.Since(commitTime.Time.Add(-state.utcOffset)).Milliseconds())
+		if key.seqval, err = lsnFromBytes(seqval); err != nil {
+			return fmt.Errorf("seqval of %s: %w", table.sourceName, err)
+		}
+		select {
+		case out <- change{key: key, record: record, commitTime: committedAt}:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return count, fmt.Errorf("failed to read changes of %s: %w", table.sourceName, err)
+		return fmt.Errorf("failed to read changes of %s: %w", table.sourceName, err)
 	}
-	return count, nil
+	close(out)
+	return nil
 }

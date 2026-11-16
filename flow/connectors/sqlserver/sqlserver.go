@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"sync/atomic"
 
 	mssql "github.com/microsoft/go-mssqldb"
 	"go.temporal.io/sdk/log"
@@ -31,8 +30,6 @@ type SqlServerConnector struct {
 	logger log.Logger
 	config *protos.SqlServerConfig
 	db     *sql.DB
-	// commits per CDC window, kept across PullRecords calls of a sync flow
-	windowCommits atomic.Uint32
 }
 
 func ConnectionString(config *protos.SqlServerConfig) string {
