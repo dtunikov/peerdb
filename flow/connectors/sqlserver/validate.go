@@ -82,7 +82,7 @@ func (c *SqlServerConnector) checkCaptureJob(ctx context.Context) error {
 	if err := c.db.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM msdb.dbo.cdc_jobs WHERE database_id = DB_ID() AND job_type = 'capture'",
 	).Scan(&count); err != nil {
-		c.logger.Warn("unable to check the CDC capture job", slog.Any("error", err))
+		c.logger.Warn("[sqlserver] unable to check the CDC capture job", slog.Any("error", err))
 		return nil
 	}
 	if count == 0 {

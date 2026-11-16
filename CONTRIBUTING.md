@@ -68,6 +68,7 @@ CI selects Tilt-tagged tests by package. E2e packages map to source jobs as foll
 | `mysql_clickhouse`, `switchboard_mysql` | `mysql_clickhouse` |
 | `mongo_clickhouse`, `switchboard_mongo` | `mongo_clickhouse` |
 | `cockroachdb_clickhouse` | `cockroachdb_clickhouse` |
+| `sqlserver_clickhouse` | `sqlserver_clickhouse` |
 | `bigquery_clickhouse` | `bigquery_clickhouse` |
 
 ## Tricky areas

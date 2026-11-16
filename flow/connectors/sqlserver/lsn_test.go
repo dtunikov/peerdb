@@ -41,3 +41,18 @@ func TestMissingColumns(t *testing.T) {
 	require.Empty(t, missingColumns(required, []string{"b", "a", "id", "extra"}))
 	require.Equal(t, []string{"a", "b"}, missingColumns(required, []string{"id"}))
 }
+
+func TestAdjustWindowCommits(t *testing.T) {
+	// overshoot shrinks k so the next window targets half a batch
+	require.Equal(t, uint32(64), adjustWindowCommits(256, 256, 2000, 1000))
+	require.Equal(t, uint32(5), adjustWindowCommits(256, 256, 25000, 1000))
+	require.Equal(t, uint32(1), adjustWindowCommits(1, 1, 2000, 1000))
+	// small full window grows k
+	require.Equal(t, uint32(512), adjustWindowCommits(256, 256, 100, 1000))
+	require.Equal(t, uint32(maxWindowCommits), adjustWindowCommits(maxWindowCommits, maxWindowCommits, 0, 1000))
+	// window cut short by pending commits keeps k
+	require.Equal(t, uint32(256), adjustWindowCommits(256, 3, 100, 1000))
+	require.Equal(t, uint32(256), adjustWindowCommits(256, 0, 0, 1000))
+	// within band keeps k
+	require.Equal(t, uint32(256), adjustWindowCommits(256, 256, 500, 1000))
+}

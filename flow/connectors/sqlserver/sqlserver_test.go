@@ -13,7 +13,7 @@ import (
 )
 
 func TestConnectionStringEscapesCredentials(t *testing.T) {
-	connStr := connectionString(&protos.SqlServerConfig{
+	connStr := ConnectionString(&protos.SqlServerConfig{
 		Server:   "db.example.com",
 		Port:     1433,
 		User:     "user@domain",

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"sync/atomic"
 
 	mssql "github.com/microsoft/go-mssqldb"
 	"go.temporal.io/sdk/log"
@@ -30,9 +31,11 @@ type SqlServerConnector struct {
 	logger log.Logger
 	config *protos.SqlServerConfig
 	db     *sql.DB
+	// commits per CDC window, kept across PullRecords calls of a sync flow
+	windowCommits atomic.Uint32
 }
 
-func connectionString(config *protos.SqlServerConfig) string {
+func ConnectionString(config *protos.SqlServerConfig) string {
 	query := url.Values{}
 	query.Set("database", config.Database)
 	query.Set("app name", "peerdb")
@@ -48,7 +51,7 @@ func connectionString(config *protos.SqlServerConfig) string {
 func NewSqlServerConnector(ctx context.Context, config *protos.SqlServerConfig) (*SqlServerConnector, error) {
 	logger := internal.LoggerFromCtx(ctx)
 
-	connector, err := mssql.NewConnector(connectionString(config))
+	connector, err := mssql.NewConnector(ConnectionString(config))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse SQL Server connection config: %w", err)
 	}
@@ -88,7 +91,7 @@ func (c *SqlServerConnector) Close() error {
 		return nil
 	}
 	if err := c.db.Close(); err != nil {
-		c.logger.Error("failed to close SQL Server connection", slog.Any("error", err))
+		c.logger.Error("[sqlserver] failed to close SQL Server connection", slog.Any("error", err))
 		return fmt.Errorf("failed to close SQL Server connection: %w", err)
 	}
 	return nil

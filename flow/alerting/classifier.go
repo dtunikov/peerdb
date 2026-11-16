@@ -122,6 +122,7 @@ const (
 	ErrorSourcePostgres        ErrorSource = "postgres"
 	ErrorSourceCockroachDB     ErrorSource = "cockroachdb"
 	ErrorSourceMySQL           ErrorSource = "mysql"
+	ErrorSourceSqlServer       ErrorSource = "sqlserver"
 	ErrorSourceMongoDB         ErrorSource = "mongodb"
 	ErrorSourceBigQuery        ErrorSource = "bigquery"
 	ErrorSourceGCS             ErrorSource = "gcs"
@@ -189,6 +190,14 @@ var (
 	// watched table truncated/dropped); only the user can fix it, via resync
 	ErrorNotifyChangefeedInvalid = ErrorClass{
 		Class: "NOTIFY_CHANGEFEED_INVALID", action: NotifyUser,
+	}
+	// SQL Server CDC cleanup removed changes the mirror has not read; only a resync helps
+	ErrorNotifySqlServerCDCDataCleanedUp = ErrorClass{
+		Class: "NOTIFY_SQLSERVER_CDC_DATA_CLEANED_UP", action: NotifyUser,
+	}
+	// SQL Server CDC capture job stopped scanning the log; the mirror resumes once the user restarts it
+	ErrorNotifySqlServerCaptureJobStalled = ErrorClass{
+		Class: "NOTIFY_SQLSERVER_CAPTURE_JOB_STALLED", action: NotifyUser,
 	}
 	ErrorNotifyBinlogEventExceededMaxAllowedPacket = ErrorClass{
 		Class: "NOTIFY_BINLOG_EVENT_EXCEEDED_MAX_ALLOWED_PACKET", action: NotifyUser,
@@ -428,6 +437,20 @@ func GetErrorClass(ctx context.Context, err error) (ErrorClass, ErrorInfo) {
 		return ErrorNotifyChangefeedInvalid, ErrorInfo{
 			Source: ErrorSourceCockroachDB,
 			Code:   changefeedErr.Code,
+		}
+	}
+
+	if _, ok := errors.AsType[*exceptions.SqlServerCDCDataCleanedUpError](err); ok {
+		return ErrorNotifySqlServerCDCDataCleanedUp, ErrorInfo{
+			Source: ErrorSourceSqlServer,
+			Code:   "CDC_DATA_CLEANED_UP",
+		}
+	}
+
+	if _, ok := errors.AsType[*exceptions.SqlServerCaptureJobStalledError](err); ok {
+		return ErrorNotifySqlServerCaptureJobStalled, ErrorInfo{
+			Source: ErrorSourceSqlServer,
+			Code:   "CDC_CAPTURE_JOB_STALLED",
 		}
 	}
 

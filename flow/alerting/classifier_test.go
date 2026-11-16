@@ -120,6 +120,27 @@ func TestCockroachChangefeedIrrecoverableErrorShouldNotifyUser(t *testing.T) {
 	}
 }
 
+func TestSqlServerCDCDataCleanedUpShouldNotifyUser(t *testing.T) {
+	t.Parallel()
+
+	err := fmt.Errorf("PullRecords failed: %w",
+		exceptions.NewSqlServerCDCDataCleanedUpError("dbo_users", "0000002a000001f00003", "0000002a000001f00001"))
+	errorClass, errInfo := GetErrorClass(t.Context(), err)
+	assert.Equal(t, ErrorNotifySqlServerCDCDataCleanedUp, errorClass)
+	assert.Equal(t, NotifyUser, errorClass.ErrorAction())
+	assert.Equal(t, ErrorInfo{Source: ErrorSourceSqlServer, Code: "CDC_DATA_CLEANED_UP"}, errInfo)
+}
+
+func TestSqlServerCaptureJobStalledShouldNotifyUser(t *testing.T) {
+	t.Parallel()
+
+	err := fmt.Errorf("PullRecords failed: %w", exceptions.NewSqlServerCaptureJobStalledError(15*time.Minute))
+	errorClass, errInfo := GetErrorClass(t.Context(), err)
+	assert.Equal(t, ErrorNotifySqlServerCaptureJobStalled, errorClass)
+	assert.Equal(t, NotifyUser, errorClass.ErrorAction())
+	assert.Equal(t, ErrorInfo{Source: ErrorSourceSqlServer, Code: "CDC_CAPTURE_JOB_STALLED"}, errInfo)
+}
+
 func TestUnwrappedPgErrorShouldKeepPostgresSource(t *testing.T) {
 	t.Parallel()
 

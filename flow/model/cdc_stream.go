@@ -25,8 +25,9 @@ type CDCStream[T Items] struct {
 	lastCheckpointID int64
 	// atomic since sources that buffer rows may set it from their read goroutine, see MarkFirstRowReceived
 	firstRowReceivedAtNano atomic.Int64
-	lastCheckpointSet      bool
-	firstRowSet            bool
+	// atomic since sources may call AddRecord from multiple goroutines
+	firstRowSet       atomic.Bool
+	lastCheckpointSet bool
 }
 
 type CdcCheckpoint struct {
@@ -61,13 +62,14 @@ func (r *CDCStream[T]) GetLastCheckpoint() CdcCheckpoint {
 }
 
 func (r *CDCStream[T]) AddRecord(ctx context.Context, record Record[T]) error {
-	if !r.firstRowSet {
+	if !r.firstRowSet.Load() {
 		switch record.(type) {
 		case *InsertRecord[T], *UpdateRecord[T], *DeleteRecord[T]:
-			r.firstRowSet = true
-			r.MarkFirstRowReceived(time.Now()) // no-op if the source already marked it at read time
-			r.firstRowCommitTime = record.GetCommitTime().UTC()
-			r.markEmptySignalReady()
+			if r.firstRowSet.CompareAndSwap(false, true) {
+				r.MarkFirstRowReceived(time.Now()) // no-op if the source already marked it at read time
+				r.firstRowCommitTime = record.GetCommitTime().UTC()
+				r.markEmptySignalReady()
+			}
 		}
 	}
 
@@ -104,7 +106,7 @@ func (r *CDCStream[T]) MarkFirstRowReceived(t time.Time) {
 
 func (r *CDCStream[T]) WaitAndCheckEmpty() bool {
 	<-r.emptySignal
-	return !r.firstRowSet
+	return !r.firstRowSet.Load()
 }
 
 func (r *CDCStream[T]) Close() {
@@ -131,13 +133,13 @@ func (r *CDCStream[T]) AddSchemaDelta(
 }
 
 func (r *CDCStream[T]) NeedsNormalize() bool {
-	return r.firstRowSet
+	return r.firstRowSet.Load()
 }
 
 // FirstRowTimes returns the received/commit timestamps of the batch's first row event.
 // ok is false if the batch had no row events (e.g. schema-delta-only batch).
 func (r *CDCStream[T]) FirstRowTimes() (time.Time, time.Time, bool) {
-	return time.Unix(0, r.firstRowReceivedAtNano.Load()).UTC(), r.firstRowCommitTime, r.firstRowSet
+	return time.Unix(0, r.firstRowReceivedAtNano.Load()).UTC(), r.firstRowCommitTime, r.firstRowSet.Load()
 }
 
 func (r *CDCStream[T]) markEmptySignalReady() {

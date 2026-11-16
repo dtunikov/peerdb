@@ -2,6 +2,9 @@ module github.com/PeerDB-io/peerdb/flow
 
 go 1.27.0
 
+// SQL Server's self-signed certificates can have negative serial numbers, which Go rejects by default since 1.23
+godebug x509negativeserial=1
+
 require (
 	cloud.google.com/go v0.123.0
 	cloud.google.com/go/auth v0.24.1
