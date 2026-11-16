@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	mssql "github.com/microsoft/go-mssqldb"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
@@ -28,9 +27,6 @@ const (
 	captureStartPollInterval = time.Second
 	captureStartTimeout      = 2 * time.Minute
 )
-
-// raised by fn_cdc_get_all_changes_* for an LSN range outside the capture instance's validity interval
-const errCDCInvalidLSNRange = 313
 
 type captureInstance struct {
 	name     string
@@ -232,16 +228,21 @@ func (c *SqlServerConnector) prepareCDCTables(ctx context.Context, req *model.Pu
 			destinationName: destination,
 			captureInstance: ci.name,
 			columns:         columns,
-			// start_lsn - lsn of tx from which the row change originates
-			// seqval - orders the operations inside a transaction
-			// operation - insert, update, delete (also update with old values when 'all update old' is used)
+			// start_lsn - commit lsn of the tx the row change belongs to
+			// command_id - order of the change rows inside a transaction
+			// seqval - log position of the operation, shared by an update's before and after images
+			// operation - delete, insert, update before-image, update after-image
 			// tran_end_time - tx commit timestamp
+			// the before-image becomes UpdateRecord.OldItems; ClickHouse needs it to tombstone the old row when a primary key changes
+			// reads the change table since fn_cdc_get_all_changes_* hides __$command_id, needed to follow the clustered
+			// index without sorting the window; NOLOCK as in the function, so the capture job does not block the read
 			changesQuery: fmt.Sprintf(`
 				SELECT c.__$start_lsn, c.__$seqval, c.__$operation, m.tran_end_time, %s
-				FROM cdc.%s(@p1, @p2, N'all update old') c
+				FROM cdc.%s c WITH (NOLOCK)
 				LEFT JOIN cdc.lsn_time_mapping m ON m.start_lsn = c.__$start_lsn
-				ORDER BY c.__$start_lsn, c.__$seqval, c.__$operation`,
-				strings.Join(selectList, ", "), quoteIdentifier("fn_cdc_get_all_changes_"+ci.name)),
+				WHERE c.__$start_lsn >= @p1 AND c.__$start_lsn <= @p2
+				ORDER BY c.__$start_lsn, c.__$command_id, c.__$seqval, c.__$operation`,
+				strings.Join(selectList, ", "), quoteIdentifier(ci.name+"_CT")),
 		})
 	}
 	return tables, nil
@@ -295,17 +296,43 @@ func (c *SqlServerConnector) checkCaptureJobScanning(ctx context.Context) error 
 	return exceptions.NewSqlServerCaptureJobStalledError(sinceScan)
 }
 
-func (c *SqlServerConnector) checkRetention(ctx context.Context, table *cdcTable, from lsn) error {
-	var b []byte
-	if err := c.db.QueryRowContext(ctx, "SELECT sys.fn_cdc_get_min_lsn(@p1)", table.captureInstance).Scan(&b); err != nil {
-		return fmt.Errorf("failed to get min LSN of %s: %w", table.captureInstance, err)
-	}
-	minLSN, err := lsnFromBytes(b)
+// checkRetention fails when cleanup removed changes at or after from in any table. Reading change tables
+// returns no error for a removed range, and cleanup can run during the read, so it runs after the window.
+// One query for all tables: cleanup moves cdc.change_tables.start_lsn, which fn_cdc_get_min_lsn returns.
+func (c *SqlServerConnector) checkRetention(ctx context.Context, tables []*cdcTable, from lsn) error {
+	rows, err := c.db.QueryContext(ctx, "SELECT capture_instance, start_lsn FROM cdc.change_tables")
 	if err != nil {
-		return fmt.Errorf("capture instance %s: %w", table.captureInstance, err)
+		return fmt.Errorf("failed to get min LSNs of capture instances: %w", err)
 	}
-	if minLSN.compare(from) > 0 {
-		return exceptions.NewSqlServerCDCDataCleanedUpError(table.captureInstance, minLSN.String(), from.String())
+	type minLSNRow struct {
+		captureInstance string
+		minLSN          []byte
+	}
+	minLSNRows, err := collectRows(rows, func(rows *sql.Rows) (minLSNRow, error) {
+		var r minLSNRow
+		err := rows.Scan(&r.captureInstance, &r.minLSN)
+		return r, err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get min LSNs of capture instances: %w", err)
+	}
+	minLSNs := make(map[string][]byte, len(minLSNRows))
+	for _, r := range minLSNRows {
+		minLSNs[r.captureInstance] = r.minLSN
+	}
+
+	for _, table := range tables {
+		b, ok := minLSNs[table.captureInstance]
+		if !ok {
+			return fmt.Errorf("capture instance %s of table %s no longer exists", table.captureInstance, table.sourceName)
+		}
+		minLSN, err := lsnFromBytes(b)
+		if err != nil {
+			return fmt.Errorf("capture instance %s: %w", table.captureInstance, err)
+		}
+		if minLSN.compare(from) > 0 {
+			return exceptions.NewSqlServerCDCDataCleanedUpError(table.captureInstance, minLSN.String(), from.String())
+		}
 	}
 	return nil
 }
@@ -319,18 +346,18 @@ func (c *SqlServerConnector) serverUTCOffset(ctx context.Context) (time.Duration
 	return time.Duration(minutes) * time.Minute, nil
 }
 
-// adjustWindowCommits sizes the next window from how many rows the last one produced.
+// adjustWindowCommits sizes the next window from how many records the last one produced.
 // Commits vary a lot in size, so a fixed k either overshoots the batch on large transactions
 // or wastes round trips on small ones. When the window alone exceeded the batch, shrink k in
 // proportion so the next one lands near half a batch. When it filled less than a quarter, double k,
 // but only if k was the limit: a window cut short by fewer pending commits says nothing about k,
 // and growing there would let an idle mirror ratchet k up to the max before the next burst.
-func adjustWindowCommits(k, windowCommits, windowRows, maxBatchSize uint32) uint32 {
-	if windowRows > maxBatchSize {
+func adjustWindowCommits(k, windowCommits, windowRecords, maxBatchSize uint32) uint32 {
+	if windowRecords > maxBatchSize {
 		target := max(maxBatchSize/2, 1)
-		return max(uint32(uint64(k)*uint64(target)/uint64(windowRows)), 1)
+		return max(uint32(uint64(k)*uint64(target)/uint64(windowRecords)), 1)
 	}
-	if windowRows < maxBatchSize/4 && windowCommits >= k {
+	if windowRecords < maxBatchSize/4 && windowCommits >= k {
 		return min(k*2, maxWindowCommits)
 	}
 	return k
@@ -425,7 +452,9 @@ func (c *SqlServerConnector) PullRecords(
 		// waits for the capture job to advance max LSN past last
 		if maxLSN.compare(last) <= 0 {
 			// caught up, so an idle mirror does not keep reporting the lag of its last change
-			otelManager.Metrics.SourceLagGauge.Record(ctx, 0)
+			if otelManager != nil {
+				otelManager.Metrics.SourceLagGauge.Record(ctx, 0)
+			}
 			if caughtUpSince.IsZero() {
 				caughtUpSince = time.Now()
 			}
@@ -467,17 +496,20 @@ func (c *SqlServerConnector) PullRecords(
 		recordsBefore := state.recordCount.Load()
 
 		// reads every table's changes in (from, to] in parallel
-		var windowRows atomic.Uint32
+		var windowRecords atomic.Uint32
 		group, groupCtx := errgroup.WithContext(ctx)
 		group.SetLimit(parallelism)
 		for _, table := range tables {
 			group.Go(func() error {
 				rows, err := c.pullTableWindow(groupCtx, state, table, from, to)
-				windowRows.Add(rows)
+				windowRecords.Add(rows)
 				return err
 			})
 		}
 		if err := group.Wait(); err != nil {
+			return err
+		}
+		if err := c.checkRetention(ctx, tables, from); err != nil {
 			return err
 		}
 
@@ -495,12 +527,12 @@ func (c *SqlServerConnector) PullRecords(
 			lastIdleCheckpoint = time.Now()
 		}
 		// adjusts k for the next window
-		if newK := adjustWindowCommits(k, windowCommits, windowRows.Load(), req.MaxBatchSize); newK != k {
+		if newK := adjustWindowCommits(k, windowCommits, windowRecords.Load(), req.MaxBatchSize); newK != k {
 			c.logger.Info("[sqlserver] adjusted CDC window size",
 				slog.Uint64("oldWindowCommits", uint64(k)),
 				slog.Uint64("newWindowCommits", uint64(newK)),
 				slog.Uint64("lastWindowCommits", uint64(windowCommits)),
-				slog.Uint64("lastWindowRows", uint64(windowRows.Load())),
+				slog.Uint64("lastWindowRecords", uint64(windowRecords.Load())),
 				slog.Uint64("maxBatchSize", uint64(req.MaxBatchSize)))
 			k = newK
 		}
@@ -511,17 +543,12 @@ func (c *SqlServerConnector) PullRecords(
 	return nil
 }
 
-// pullTableWindow emits the table's changes in (from-1, to] and returns how many change rows it read
+// pullTableWindow emits the table's changes in (from-1, to] and returns how many records it emitted.
 func (c *SqlServerConnector) pullTableWindow(
 	ctx context.Context, state *pullState, table *cdcTable, from lsn, to lsn,
 ) (uint32, error) {
 	rows, err := c.db.QueryContext(ctx, table.changesQuery, from[:], to[:])
 	if err != nil {
-		if msErr, ok := errors.AsType[mssql.Error](err); ok && msErr.Number == errCDCInvalidLSNRange {
-			if retErr := c.checkRetention(ctx, table, from); retErr != nil {
-				return 0, retErr
-			}
-		}
 		return 0, fmt.Errorf("failed to read changes of %s: %w", table.sourceName, err)
 	}
 	defer rows.Close()
@@ -543,7 +570,6 @@ func (c *SqlServerConnector) pullTableWindow(
 		if err := rows.Scan(ptrs...); err != nil {
 			return count, fmt.Errorf("failed to scan change of %s: %w", table.sourceName, err)
 		}
-		count++
 
 		items := model.NewRecordItems(len(table.columns) + 1)
 		for i, col := range table.columns {
@@ -601,6 +627,7 @@ func (c *SqlServerConnector) pullTableWindow(
 		if err := state.addRecord(ctx, record); err != nil {
 			return count, err
 		}
+		count++
 		if state.otelManager != nil && commitTime.Valid {
 			state.otelManager.Metrics.SourceLagGauge.Record(ctx, time.Since(commitTime.Time.Add(-state.utcOffset)).Milliseconds())
 		}
